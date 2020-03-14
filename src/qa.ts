@@ -1,14 +1,16 @@
+import { exists as fsExists } from "fs";
 import path from "path";
 import { BertWordPieceTokenizer, Encoding, TruncationStrategy } from "tokenizers";
+import { promisify } from "util";
 
-import { LocalModel } from "./local.model";
-import { Model } from "./model";
-import { ModelOptions, QAOptions } from "./qa-options";
-import { RemoteModel } from "./remote.model";
-
-const DEFAULT_ASSETS_PATH = path.join(process.cwd(), "./.models");
-const DEFAULT_MODEL_PATH = path.join(DEFAULT_ASSETS_PATH, "distilbert-cased");
-const DEFAULT_VOCAB_PATH = path.join(DEFAULT_MODEL_PATH, "vocab.txt");
+import { Model } from "./models/model";
+import { SavedModel } from "./models/saved-model.model";
+import {
+  DEFAULT_ASSETS_PATH,
+  DEFAULT_MODEL_PATH,
+  DEFAULT_VOCAB_PATH,
+  QAOptions
+} from "./qa-options";
 
 interface Feature {
   contextLength: number;
@@ -24,7 +26,7 @@ interface Span {
   startIndex: number;
 }
 
-interface Answer {
+export interface Answer {
   /**
    * Only provided if `timeIt` option was true when creating the QAClient
    */
@@ -51,14 +53,35 @@ export class QAClient {
   ) {}
 
   static async fromOptions(options?: QAOptions): Promise<QAClient> {
-    const model = await this.getModel(options?.model);
+    const model =
+      options?.model ??
+      (await SavedModel.fromOptions({ path: DEFAULT_MODEL_PATH, cased: true }));
 
-    const tokenizer =
-      options?.tokenizer ??
-      (await BertWordPieceTokenizer.fromOptions({
-        vocabFile: options?.vocabPath ?? DEFAULT_VOCAB_PATH,
+    let tokenizer: BertWordPieceTokenizer;
+    if (options?.tokenizer) {
+      tokenizer = options.tokenizer;
+    } else {
+      let vocabPath = options?.vocabPath;
+      if (!vocabPath) {
+        if (options?.model?.params.path) {
+          const existsAsync = promisify(fsExists);
+          const fullPath = (await existsAsync(options.model.params.path))
+            ? path.join(options.model.params.path, "vocab.txt")
+            : path.join(DEFAULT_ASSETS_PATH, options.model.params.path, "vocab.txt");
+
+          if (await existsAsync(fullPath)) {
+            vocabPath = fullPath;
+          }
+        }
+
+        vocabPath = vocabPath ?? DEFAULT_VOCAB_PATH;
+      }
+
+      tokenizer = await BertWordPieceTokenizer.fromOptions({
+        vocabFile: vocabPath,
         lowercase: !model.params.cased
-      }));
+      });
+    }
 
     return new QAClient(model, tokenizer, options?.timeIt);
   }
@@ -73,8 +96,8 @@ export class QAClient {
 
     const inferenceStartTime = Date.now();
     const [startLogits, endLogits] = await this.model.runInference(
-      features.map(f => f.encoding.getIds()),
-      features.map(f => f.encoding.getAttentionMask())
+      features.map(f => f.encoding.ids),
+      features.map(f => f.encoding.attentionMask)
     );
     const elapsedInferenceTime = Date.now() - inferenceStartTime;
 
@@ -104,16 +127,15 @@ export class QAClient {
     });
 
     const encoding = await this.tokenizer.encode(question, context);
-    const encodings = [encoding, ...encoding.getOverflowing()];
+    const encodings = [encoding, ...encoding.overflowing];
 
     const questionLength =
-      encoding.getTokens().indexOf(this.tokenizer.configuration.sepToken) - 1; // Take [CLS] into account
+      encoding.tokens.indexOf(this.tokenizer.configuration.sepToken) - 1; // Take [CLS] into account
     const questionLengthWithTokens = questionLength + 2;
 
     const spans: Span[] = encodings.map((e, i) => {
-      const specialTokensMask = e.getSpecialTokensMask();
-      const nbAddedTokens = specialTokensMask.reduce((acc, val) => acc + val, 0);
-      const actualLength = specialTokensMask.length - nbAddedTokens;
+      const nbAddedTokens = e.specialTokensMask.reduce((acc, val) => acc + val, 0);
+      const actualLength = e.length - nbAddedTokens;
 
       return {
         startIndex: i * stride,
@@ -196,7 +218,7 @@ export class QAClient {
     }
 
     const answer = answers.sort((a, b) => b.score - a.score)[0];
-    const offsets = answer.feature.encoding.getOffsets();
+    const offsets = answer.feature.encoding.offsets;
     const answerText = features[0].encoding.getOriginalString(
       offsets[answer.startIndex][0],
       offsets[answer.endIndex][1]
@@ -210,14 +232,6 @@ export class QAClient {
       text: answerText,
       score: Math.round((probScore + Number.EPSILON) * 100) / 100
     };
-  }
-
-  private static async getModel(options?: ModelOptions): Promise<Model> {
-    if (options && options.remote) {
-      return RemoteModel.fromOptions(options);
-    } else {
-      return LocalModel.fromOptions(options ?? { path: DEFAULT_MODEL_PATH, cased: true });
-    }
   }
 }
 

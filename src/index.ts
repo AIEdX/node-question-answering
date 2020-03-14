@@ -1,2 +1,3 @@
 export * from "./qa";
-export * from "./qa-options";
+export * from "./models";
+export { QAOptions } from "./qa-options";
